@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import re
+from fuzzywuzzy import fuzz, process
 
 from .dump import dump  # noqa: F401
 from .parsers import filename_to_lang
@@ -87,18 +88,50 @@ class TreeContext:
 
         return
 
-    def grep(self, pat, ignore_case):
+    def grep(self, pat, ignore_case, fuzzy_threshold=80):
+        """
+        Search lines for exact regex matches and fuzzy matches above the threshold.
+
+        Args:
+            pat (str): The regex pattern to search for.
+            ignore_case (bool): Whether to ignore case in regex search.
+            fuzzy_threshold (int): Minimum similarity ratio (0-100) for fuzzy matches.
+
+        Returns:
+            set: Line numbers where either regex or fuzzy matches were found.
+        """
         found = set()
+        flags = re.IGNORECASE if ignore_case else 0
         for i, line in enumerate(self.lines):
-            if re.search(pat, line, re.IGNORECASE if ignore_case else 0):
+            regex_match = re.search(pat, line, flags)
+            fuzzy_match = False
+            # Check fuzzy match against each word in the line
+            for word in re.findall(r"\w+", line):
+                ratio = fuzz.ratio(pat.lower(), word.lower())
+                if ratio >= fuzzy_threshold:
+                    fuzzy_match = True
+                    break
+
+            if regex_match or fuzzy_match:
+                # Highlight matches when color is enabled
                 if self.color:
-                    highlighted_line = re.sub(
-                        pat,
-                        lambda match: f"\033[1;31m{match.group()}\033[0m",  # noqa
-                        line,
-                        flags=re.IGNORECASE if ignore_case else 0,
-                    )
-                    self.output_lines[i] = highlighted_line
+                    highlighted = line
+                    if regex_match:
+                        highlighted = re.sub(
+                            pat,
+                            lambda m: f"\033[1;31m{m.group()}\033[0m",
+                            highlighted,
+                            flags=flags,
+                        )
+                    if fuzzy_match:
+                        for word in re.findall(r"\w+", line):
+                            if fuzz.ratio(pat.lower(), word.lower()) >= fuzzy_threshold:
+                                highlighted = re.sub(
+                                    rf"({word})",
+                                    lambda m: f"\033[1;33m{m.group()}\033[0m",
+                                    highlighted,
+                                )
+                    self.output_lines[i] = highlighted
                 found.add(i)
         return found
 
@@ -110,22 +143,16 @@ class TreeContext:
             return
 
         self.done_parent_scopes = set()
-
         self.show_lines = set(self.lines_of_interest)
 
         if self.loi_pad:
             for line in list(self.show_lines):
                 for new_line in range(line - self.loi_pad, line + self.loi_pad + 1):
-                    # if not self.scopes[line].intersection(self.scopes[new_line]):
-                    #    continue
-                    if new_line >= self.num_lines:
-                        continue
-                    if new_line < 0:
+                    if new_line >= self.num_lines or new_line < 0:
                         continue
                     self.show_lines.add(new_line)
 
         if self.last_line:
-            # add the bottom line (plus parent context)
             bottom_line = self.num_lines - 2
             self.show_lines.add(bottom_line)
             self.add_parent_scopes(bottom_line)
@@ -138,7 +165,6 @@ class TreeContext:
             for i in set(self.lines_of_interest):
                 self.add_child_context(i)
 
-        # add the top margin lines of the file
         if self.margin:
             self.show_lines.update(range(self.margin))
 
@@ -165,10 +191,7 @@ class TreeContext:
         )
 
         currently_showing = len(self.show_lines)
-        max_to_show = 25
-        min_to_show = 5
-        percent_to_show = 0.10
-        max_to_show = max(min(size * percent_to_show, max_to_show), min_to_show)
+        max_to_show = max(min(size * 0.10, 25), 5)
 
         for child in children:
             if len(self.show_lines) > currently_showing + max_to_show:
@@ -183,20 +206,15 @@ class TreeContext:
         return children
 
     def get_last_line_of_scope(self, i):
-        last_line = max(node.end_point[0] for node in self.nodes[i])
-        return last_line
+        return max(node.end_point[0] for node in self.nodes[i])
 
     def close_small_gaps(self):
-        # a "closing" operation on the integers in set.
-        # if i and i+2 are in there but i+1 is not, I want to add i+1
-        # Create a new set for the "closed" lines
         closed_show = set(self.show_lines)
         sorted_show = sorted(self.show_lines)
-        for i in range(len(sorted_show) - 1):
-            if sorted_show[i + 1] - sorted_show[i] == 2:
-                closed_show.add(sorted_show[i] + 1)
+        for idx in range(len(sorted_show) - 1):
+            if sorted_show[idx + 1] - sorted_show[idx] == 2:
+                closed_show.add(sorted_show[idx] + 1)
 
-        # pick up adjacent blank lines
         for i, line in enumerate(self.lines):
             if i not in closed_show:
                 continue
@@ -211,32 +229,24 @@ class TreeContext:
 
         output = ""
         if self.color:
-            # reset
             output += "\033[0m\n"
 
         dots = not (0 in self.show_lines)
         for i, line in enumerate(self.lines):
             if i not in self.show_lines:
                 if dots:
-                    if self.line_number:
-                        output += "...⋮...\n"
-                    else:
-                        output += "⋮\n"
+                    output += (f"{i + 1: 3}...⋮...\n" if self.line_number else "⋮\n")
                     dots = False
                 continue
 
-            if i in self.lines_of_interest and self.mark_lois:
-                spacer = "█"
-                if self.color:
-                    spacer = f"\033[31m{spacer}\033[0m"
-            else:
-                spacer = "│"
+            spacer = "█" if (i in self.lines_of_interest and self.mark_lois) else "│"
+            if self.color and spacer == "█":
+                spacer = f"\033[31m{spacer}\033[0m"
 
             line_output = f"{spacer}{self.output_lines.get(i, line)}"
             if self.line_number:
                 line_output = f"{i + 1: 3}" + line_output
             output += line_output + "\n"
-
             dots = True
 
         return output
@@ -259,21 +269,11 @@ class TreeContext:
                 self.add_parent_scopes(last_line)
 
     def walk_tree(self, node, depth=0):
-        start = node.start_point
-        end = node.end_point
-
-        start_line = start[0]
-        end_line = end[0]
+        start_line, end_line = node.start_point[0], node.end_point[0]
         size = end_line - start_line
 
         self.nodes[start_line].append(node)
-
-        # dump(start_line, end_line, node.text)
         if self.verbose and node.is_named:
-            """
-            for k in dir(node):
-                print(k, getattr(node, k))
-            """
             print(
                 "   " * depth,
                 node.type,

@@ -1,2 +1,4 @@
 tree-sitter-language-pack
 pathspec
+fuzzywuzzy
+python-Levenshtein
